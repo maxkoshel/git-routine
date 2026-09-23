@@ -13,13 +13,25 @@
  * as `--base`, via origin/HEAD).
  *
  * Usage:
- *   node scripts/fixup-changes.cjs --dry-run [--base=<ref>]
- *   node scripts/fixup-changes.cjs [--base=<ref>]
+ *   node scripts/fixup-changes.cjs --dry-run [--base=<ref>] [--target=<sha>]
+ *   node scripts/fixup-changes.cjs [--base=<ref>] [--target=<sha>]
  *
  * --dry-run prints the grouping and the exact commands that would run,
  * without staging, committing, or pushing anything. Without --dry-run, it
  * creates the fixup commits, then runs `git rebase --autosquash` and
  * `git push --force-with-lease` to squash and push them.
+ *
+ * --target=<sha> restricts the run to a single target commit's hunks (match
+ * by any unique sha prefix), leaving every other group unstaged. Useful on a
+ * branch where autosquash conflicts a lot: fix up and rebase one commit at a
+ * time instead of all of them in one rebase.
+ *
+ * Note: the order fixup commits are *created* in has no effect on rebase
+ * conflicts — `--autosquash` always replays each one right after its target,
+ * regardless of creation order. Conflicts happen when some *other* commit on
+ * the branch also touched the same lines after the target commit; the
+ * "later commits touch this file" count next to each group is a rough proxy
+ * for that risk.
  */
 'use strict';
 
@@ -47,7 +59,9 @@ const parseArgs = (argv) => {
   const dryRun = argv.includes('--dry-run');
   const baseArg = argv.find((arg) => arg.startsWith('--base='));
   const base = baseArg ? baseArg.slice('--base='.length) : null;
-  return { dryRun, base };
+  const targetArg = argv.find((arg) => arg.startsWith('--target='));
+  const target = targetArg ? targetArg.slice('--target='.length) : null;
+  return { dryRun, base, target };
 };
 
 /**
@@ -125,6 +139,41 @@ const getCandidateCommits = (mergeBase) => {
 
   return map;
 };
+
+/**
+ * Resolves --target to a full candidate sha by unique prefix match, or
+ * aborts if it doesn't match exactly one candidate commit.
+ * @param {string | null} targetArg
+ * @param {Map<string, string>} candidateShas
+ * @returns {string | null}
+ */
+const resolveTarget = (targetArg, candidateShas) => {
+  if (!targetArg) return null;
+
+  const matches = [...candidateShas.keys()].filter((sha) =>
+    sha.startsWith(targetArg),
+  );
+  if (matches.length !== 1) {
+    console.error(
+      `Aborting: --target=${targetArg} matches ${matches.length} candidate commit(s), expected exactly 1.`,
+    );
+    process.exit(1);
+  }
+  return matches[0];
+};
+
+/**
+ * Counts commits strictly after `sha` that also touched `file` — a rough
+ * proxy for how likely `--autosquash` is to conflict when replaying a fixup
+ * for `sha` back to that point in history.
+ * @param {string} sha
+ * @param {string} file
+ * @returns {number}
+ */
+const countLaterTouches = (sha, file) =>
+  git(['log', '--format=%H', `${sha}..HEAD`, '--', file])
+    .split('\n')
+    .filter(Boolean).length;
 
 /**
  * @typedef {{ oldStart: number, oldLines: number, newStart: number, newLines: number, text: string }} Hunk
@@ -522,6 +571,10 @@ const executeQueue = (queue) => {
  * @returns {void}
  */
 const rebaseAndPush = (mergeBase) => {
+  // Repeated/near-identical conflicts (common on branches with many small
+  // mechanical commits) auto-resolve after the first fix once rerere is on.
+  git(['config', 'rerere.enabled', 'true']);
+
   execFileSync('git', ['rebase', '--autosquash', mergeBase], {
     stdio: 'inherit',
     env: { ...process.env, GIT_SEQUENCE_EDITOR: 'true' },
@@ -530,7 +583,11 @@ const rebaseAndPush = (mergeBase) => {
 };
 
 const main = () => {
-  const { dryRun, base: baseArg } = parseArgs(process.argv.slice(2));
+  const {
+    dryRun,
+    base: baseArg,
+    target: targetArg,
+  } = parseArgs(process.argv.slice(2));
 
   ensureNotOnDefaultBranch();
   ensureNoStagedChanges();
@@ -538,6 +595,7 @@ const main = () => {
   const base = resolveBase(baseArg);
   const mergeBase = git(['merge-base', 'HEAD', base]).trim();
   const candidateShas = getCandidateCommits(mergeBase);
+  const target = resolveTarget(targetArg, candidateShas);
 
   const diffText = git(['diff', '--no-color', '-U3']);
   if (!diffText.trim()) {
@@ -563,11 +621,17 @@ const main = () => {
   const queue = [];
   for (const { fileDiff, runs } of perFile) {
     // Bottom of the file first; independent files can interleave freely.
-    const sorted = [...runs].sort(
-      (a, b) => b.hunks[0].oldStart - a.hunks[0].oldStart,
-    );
+    const sorted = [...runs]
+      .filter((run) => !target || run.sha === target)
+      .sort((a, b) => b.hunks[0].oldStart - a.hunks[0].oldStart);
     for (const run of sorted)
       queue.push({ file: fileDiff.path, fileDiff, run });
+  }
+
+  if (target) {
+    console.log(
+      `--target=${shortSha(target)}: only that commit's fixups will be created now.\n`,
+    );
   }
 
   printPlan({ groups, candidateShas, perFile, queue, mergeBase, base, dryRun });
