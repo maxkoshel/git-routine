@@ -12,14 +12,22 @@
  * Refuses to run at all on the repo's default branch (detected the same way
  * as `--base`, via origin/HEAD).
  *
+ * On a branch tracked in `.git/gh-stack` (github/gh-stack), the default
+ * base is that branch's actual stack parent instead of origin/HEAD —
+ * otherwise a hunk could blame to a commit that belongs to a different
+ * level of the stack, and autosquash would rewrite shared history. Refuses
+ * to run if that parent isn't an ancestor of HEAD (the stack is out of
+ * sync) or if `--base` was given but doesn't match it.
+ *
  * Usage:
  *   node scripts/fixup-changes.cjs --dry-run [--base=<ref>] [--target=<sha>]
  *   node scripts/fixup-changes.cjs [--base=<ref>] [--target=<sha>]
  *
  * --dry-run prints the grouping and the exact commands that would run,
- * without staging, committing, or pushing anything. Without --dry-run, it
- * creates the fixup commits, then runs `git rebase --autosquash` and
- * `git push --force-with-lease` to squash and push them.
+ * without staging or committing anything. Without --dry-run, it creates the
+ * fixup commits, then runs `git rebase --autosquash` to squash them.
+ * Pushing is left to you — the right push (upstream, force flags, etc.)
+ * depends on your workflow.
  *
  * --target=<sha> restricts the run to a single target commit's hunks (match
  * by any unique sha prefix), leaving every other group unstaged. Useful on a
@@ -33,12 +41,18 @@
  * "later commits touch this file" count next to each group is a rough proxy
  * for that risk.
  */
-'use strict';
+"use strict";
 
-const { execFileSync } = require('node:child_process');
-const { writeFileSync, mkdtempSync, rmSync } = require('node:fs');
-const { tmpdir } = require('node:os');
-const path = require('node:path');
+const { execFileSync } = require("node:child_process");
+const {
+  writeFileSync,
+  mkdtempSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+} = require("node:fs");
+const { tmpdir } = require("node:os");
+const path = require("node:path");
 
 /**
  * Runs a git command and returns its stdout, throwing with stderr on failure.
@@ -46,8 +60,8 @@ const path = require('node:path');
  * @returns {string}
  */
 const git = (args) =>
-  execFileSync('git', args, {
-    encoding: 'utf8',
+  execFileSync("git", args, {
+    encoding: "utf8",
     maxBuffer: 1024 * 1024 * 64,
   });
 
@@ -56,11 +70,11 @@ const git = (args) =>
  * @returns {{ dryRun: boolean, base: string | null }}
  */
 const parseArgs = (argv) => {
-  const dryRun = argv.includes('--dry-run');
-  const baseArg = argv.find((arg) => arg.startsWith('--base='));
-  const base = baseArg ? baseArg.slice('--base='.length) : null;
-  const targetArg = argv.find((arg) => arg.startsWith('--target='));
-  const target = targetArg ? targetArg.slice('--target='.length) : null;
+  const dryRun = argv.includes("--dry-run");
+  const baseArg = argv.find((arg) => arg.startsWith("--base="));
+  const base = baseArg ? baseArg.slice("--base=".length) : null;
+  const targetArg = argv.find((arg) => arg.startsWith("--target="));
+  const target = targetArg ? targetArg.slice("--target=".length) : null;
   return { dryRun, base, target };
 };
 
@@ -70,12 +84,12 @@ const parseArgs = (argv) => {
  * @returns {void}
  */
 const ensureNoStagedChanges = () => {
-  const staged = git(['diff', '--cached', '--name-only']).trim();
+  const staged = git(["diff", "--cached", "--name-only"]).trim();
 
   if (staged) {
     console.error(
-      'Aborting: you have staged changes. Commit or unstage them first — ' +
-        'this script only groups unstaged changes.',
+      "Aborting: you have staged changes. Commit or unstage them first — " +
+        "this script only groups unstaged changes.",
     );
     process.exit(1);
   }
@@ -89,9 +103,9 @@ const resolveBase = (base) => {
   if (base) return base;
 
   try {
-    return git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).trim();
+    return git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).trim();
   } catch {
-    return 'main';
+    return "main";
   }
 };
 
@@ -102,14 +116,76 @@ const resolveBase = (base) => {
  * @returns {void}
  */
 const ensureNotOnDefaultBranch = () => {
-  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
-  const defaultBranch = resolveBase(null).replace(/^origin\//, '');
+  const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+  const defaultBranch = resolveBase(null).replace(/^origin\//, "");
 
   if (branch === defaultBranch) {
     console.error(
       `Aborting: you're on '${branch}', this repo's default branch. Check out ` +
-        'a feature branch first — fixup commits only make sense relative to ' +
+        "a feature branch first — fixup commits only make sense relative to " +
         "that branch's own commits.",
+    );
+    process.exit(1);
+  }
+};
+
+/**
+ * Reads `.git/gh-stack` (checking the current worktree's git-dir first,
+ * then the shared one) and returns this branch's stack parent — the branch
+ * immediately below it, or the stack's trunk if it's at the bottom. Returns
+ * null if gh-stack isn't in use, or this branch isn't tracked in it.
+ * @param {string} branch
+ * @returns {string | null}
+ */
+const resolveStackParent = (branch) => {
+  const dirs = [
+    git(["rev-parse", "--git-dir"]).trim(),
+    git(["rev-parse", "--git-common-dir"]).trim(),
+  ];
+  const stackFile = dirs
+    .map((dir) => path.join(dir, "gh-stack"))
+    .find((file) => existsSync(file));
+  if (!stackFile) return null;
+
+  const data = JSON.parse(readFileSync(stackFile, "utf8"));
+  for (const stack of data.stacks || []) {
+    const index = stack.branches.findIndex((b) => b.branch === branch);
+    if (index === -1) continue;
+    return index === 0 ? stack.trunk.branch : stack.branches[index - 1].branch;
+  }
+  return null;
+};
+
+/**
+ * Aborts if this branch is tracked in `.git/gh-stack` but its recorded stack
+ * parent isn't an ancestor of HEAD (the stack is out of sync — see
+ * `gh stack rebase`), or if `--base` was given but doesn't match that
+ * parent. Fixing up against the wrong base can target a commit that belongs
+ * to a different level of the stack.
+ * @param {{ branch: string, stackParent: string | null, baseArg: string | null }} params
+ * @returns {void}
+ */
+const ensureStackIsHealthy = ({ branch, stackParent, baseArg }) => {
+  if (!stackParent) return;
+
+  if (baseArg && baseArg !== stackParent) {
+    console.error(
+      `Aborting: '${branch}' is stacked on '${stackParent}' per .git/gh-stack, ` +
+        `but --base=${baseArg} was given. Pass --base=${stackParent}, or fix ` +
+        "the stack first if that looks wrong.",
+    );
+    process.exit(1);
+  }
+
+  try {
+    git(["merge-base", "--is-ancestor", stackParent, "HEAD"]);
+  } catch {
+    console.error(
+      `Aborting: '${stackParent}' is this branch's stack parent per ` +
+        ".git/gh-stack, but it isn't an ancestor of HEAD anymore — the stack " +
+        "is out of sync. Run 'gh stack rebase' (or fix it manually) before " +
+        "fixing up, or you risk creating a fixup commit for a commit from " +
+        "another level of the stack.",
     );
     process.exit(1);
   }
@@ -128,12 +204,12 @@ const shortSha = (sha) => sha.slice(0, 7);
  * @returns {Map<string, string>}
  */
 const getCandidateCommits = (mergeBase) => {
-  const out = git(['log', '--format=%H%x1f%s', `${mergeBase}..HEAD`]);
+  const out = git(["log", "--format=%H%x1f%s", `${mergeBase}..HEAD`]);
   const map = new Map();
 
-  for (const line of out.split('\n')) {
+  for (const line of out.split("\n")) {
     if (!line) continue;
-    const [sha, subject] = line.split('\x1f');
+    const [sha, subject] = line.split("\x1f");
     map.set(sha, subject);
   }
 
@@ -171,8 +247,8 @@ const resolveTarget = (targetArg, candidateShas) => {
  * @returns {number}
  */
 const countLaterTouches = (sha, file) =>
-  git(['log', '--format=%H', `${sha}..HEAD`, '--', file])
-    .split('\n')
+  git(["log", "--format=%H", `${sha}..HEAD`, "--", file])
+    .split("\n")
     .filter(Boolean).length;
 
 /**
@@ -188,8 +264,8 @@ const countLaterTouches = (sha, file) =>
  * @returns {FileDiff[]}
  */
 const parseDiff = (diffText) => {
-  const lines = diffText.split('\n');
-  if (lines[lines.length - 1] === '') lines.pop();
+  const lines = diffText.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
 
   /** @type {FileDiff[]} */
   const files = [];
@@ -204,11 +280,11 @@ const parseDiff = (diffText) => {
   };
 
   for (const line of lines) {
-    if (line.startsWith('diff --git ')) {
+    if (line.startsWith("diff --git ")) {
       pushHunk();
       const match = line.match(/^diff --git a\/(.+) b\/(.+)$/);
       current = {
-        path: match ? match[2] : '',
+        path: match ? match[2] : "",
         headerLines: [line],
         isNewFile: false,
         isDeletedFile: false,
@@ -222,7 +298,7 @@ const parseDiff = (diffText) => {
 
     if (!current) continue;
 
-    if (line.startsWith('@@ ')) {
+    if (line.startsWith("@@ ")) {
       pushHunk();
       const m = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
       currentHunk = {
@@ -241,12 +317,12 @@ const parseDiff = (diffText) => {
     }
 
     current.headerLines.push(line);
-    if (line.startsWith('new file mode')) current.isNewFile = true;
-    if (line.startsWith('deleted file mode')) current.isDeletedFile = true;
-    if (line.startsWith('rename from') || line.startsWith('rename to')) {
+    if (line.startsWith("new file mode")) current.isNewFile = true;
+    if (line.startsWith("deleted file mode")) current.isDeletedFile = true;
+    if (line.startsWith("rename from") || line.startsWith("rename to")) {
       current.isRename = true;
     }
-    if (line.startsWith('Binary files')) current.isBinary = true;
+    if (line.startsWith("Binary files")) current.isBinary = true;
   }
   pushHunk();
 
@@ -262,13 +338,13 @@ const parseDiff = (diffText) => {
 const getBlameShas = (file) => {
   let out;
   try {
-    out = git(['blame', '--line-porcelain', 'HEAD', '--', file]);
+    out = git(["blame", "--line-porcelain", "HEAD", "--", file]);
   } catch {
     return null;
   }
 
   const shas = [];
-  for (const line of out.split('\n')) {
+  for (const line of out.split("\n")) {
     const m = line.match(/^([0-9a-f]{40}) \d+ (\d+)/);
     if (m) shas[Number(m[2])] = m[1];
   }
@@ -337,12 +413,12 @@ const targetForHunk = (shas, hunk) => {
 const buildFileRuns = (fileDiff, candidateShas) => {
   if (fileDiff.isBinary || fileDiff.isRename) {
     const reason = fileDiff.isRename
-      ? 'rename, handle manually'
-      : 'binary file';
+      ? "rename, handle manually"
+      : "binary file";
     return {
       runs: [],
       skipped: fileDiff.hunks.length
-        ? [{ category: 'manual', reason, hunks: fileDiff.hunks }]
+        ? [{ category: "manual", reason, hunks: fileDiff.hunks }]
         : [],
     };
   }
@@ -353,8 +429,8 @@ const buildFileRuns = (fileDiff, candidateShas) => {
       skipped: fileDiff.hunks.length
         ? [
             {
-              category: 'new',
-              reason: 'new file, no prior history',
+              category: "new",
+              reason: "new file, no prior history",
               hunks: fileDiff.hunks,
             },
           ]
@@ -367,7 +443,7 @@ const buildFileRuns = (fileDiff, candidateShas) => {
     return {
       runs: [],
       skipped: [
-        { category: 'manual', reason: 'blame failed', hunks: fileDiff.hunks },
+        { category: "manual", reason: "blame failed", hunks: fileDiff.hunks },
       ],
     };
   }
@@ -389,10 +465,10 @@ const buildFileRuns = (fileDiff, candidateShas) => {
     if (!isCandidate) {
       const entry = sha
         ? {
-            category: 'external',
+            category: "external",
             reason: `belongs to ${shortSha(sha)}, outside this branch`,
           }
-        : { category: 'new', reason: 'no prior history at this location' };
+        : { category: "new", reason: "no prior history at this location" };
       skipped.push({ ...entry, hunks: [hunk] });
       currentRun = null;
       continue;
@@ -416,7 +492,7 @@ const buildFileRuns = (fileDiff, candidateShas) => {
  * @returns {string}
  */
 const buildRunPatch = (fileDiff, run) =>
-  `${fileDiff.headerLines.join('\n')}\n${run.hunks.map((h) => h.text).join('')}`;
+  `${fileDiff.headerLines.join("\n")}\n${run.hunks.map((h) => h.text).join("")}`;
 
 /**
  * @param {Hunk} hunk
@@ -438,10 +514,10 @@ const printSkippedSection = (title, entries) => {
   console.log(title);
   for (const e of entries) {
     console.log(
-      `    ${e.file}: ${e.hunks.map(describeRange).join(', ')} — ${e.reason}`,
+      `    ${e.file}: ${e.hunks.map(describeRange).join(", ")} — ${e.reason}`,
     );
   }
-  console.log('');
+  console.log("");
 };
 
 /**
@@ -489,11 +565,11 @@ const printPlan = ({
       skippedByCategory.external,
     );
     printSkippedSection(
-      'Completely new (no prior commit to fix up):',
+      "Completely new (no prior commit to fix up):",
       skippedByCategory.new,
     );
     printSkippedSection(
-      'Needs manual handling (rename/binary/blame failure):',
+      "Needs manual handling (rename/binary/blame failure):",
       skippedByCategory.manual,
     );
   }
@@ -503,7 +579,7 @@ const printPlan = ({
     .filter((sha) => groups.has(sha));
 
   if (orderedShas.length === 0) {
-    console.log('No unstaged hunks matched a commit in this branch.\n');
+    console.log("No unstaged hunks matched a commit in this branch.\n");
   }
 
   orderedShas.forEach((sha, index) => {
@@ -511,34 +587,31 @@ const printPlan = ({
       `[${index + 1}/${orderedShas.length}] fixup! ${shortSha(sha)} ${candidateShas.get(sha)}`,
     );
     for (const { file, hunks } of groups.get(sha)) {
-      console.log(`    ${file}: ${hunks.map(describeRange).join(', ')}`);
+      console.log(`    ${file}: ${hunks.map(describeRange).join(", ")}`);
     }
     console.log(`    -> git commit --fixup=${sha}\n`);
   });
 
   if (queue.length) {
     console.log(
-      `Commands that would run, in order (${dryRun ? 'dry run' : 'executing'}):`,
+      `Commands that would run, in order (${dryRun ? "dry run" : "executing"}):`,
     );
     for (const { file, run } of queue) {
       console.log(
-        `  git apply --cached   # ${file}: ${run.hunks.map(describeRange).join(', ')}`,
+        `  git apply --cached   # ${file}: ${run.hunks.map(describeRange).join(", ")}`,
       );
       console.log(`  git commit --fixup=${shortSha(run.sha)} --no-edit`);
     }
-    console.log('');
+    console.log("");
   }
 
   if (dryRun) {
     console.log(
-      'After the fixup commits exist, review them, then squash and push yourself:',
+      "After the fixup commits exist, review them, then squash them yourself:",
     );
     console.log(`  git rebase --autosquash ${shortSha(mergeBase)}`);
-    console.log('  git push --force-with-lease');
   } else {
-    console.log(
-      `Then: git rebase --autosquash ${shortSha(mergeBase)} && git push --force-with-lease`,
-    );
+    console.log(`Then: git rebase --autosquash ${shortSha(mergeBase)}`);
   }
 };
 
@@ -550,13 +623,13 @@ const printPlan = ({
  * @returns {void}
  */
 const executeQueue = (queue) => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'fixup-changes-'));
+  const dir = mkdtempSync(path.join(tmpdir(), "fixup-changes-"));
   try {
     queue.forEach(({ fileDiff, run }, index) => {
       const patchPath = path.join(dir, `patch-${index}.diff`);
       writeFileSync(patchPath, buildRunPatch(fileDiff, run));
-      git(['apply', '--cached', patchPath]);
-      git(['commit', `--fixup=${run.sha}`, '--no-edit']);
+      git(["apply", "--cached", patchPath]);
+      git(["commit", `--fixup=${run.sha}`, "--no-edit"]);
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -565,21 +638,20 @@ const executeQueue = (queue) => {
 
 /**
  * Squashes every fixup commit into its target (autosquash reorders and
- * squashes purely from the `fixup!` subjects, so no editor is needed), then
- * pushes the result.
+ * squashes purely from the `fixup!` subjects, so no editor is needed).
+ * Pushing is left to the caller.
  * @param {string} mergeBase
  * @returns {void}
  */
-const rebaseAndPush = (mergeBase) => {
+const rebase = (mergeBase) => {
   // Repeated/near-identical conflicts (common on branches with many small
   // mechanical commits) auto-resolve after the first fix once rerere is on.
-  git(['config', 'rerere.enabled', 'true']);
+  git(["config", "rerere.enabled", "true"]);
 
-  execFileSync('git', ['rebase', '--autosquash', mergeBase], {
-    stdio: 'inherit',
-    env: { ...process.env, GIT_SEQUENCE_EDITOR: 'true' },
+  execFileSync("git", ["rebase", "--autosquash", mergeBase], {
+    stdio: "inherit",
+    env: { ...process.env, GIT_SEQUENCE_EDITOR: "true" },
   });
-  execFileSync('git', ['push', '--force-with-lease'], { stdio: 'inherit' });
 };
 
 const main = () => {
@@ -592,14 +664,18 @@ const main = () => {
   ensureNotOnDefaultBranch();
   ensureNoStagedChanges();
 
-  const base = resolveBase(baseArg);
-  const mergeBase = git(['merge-base', 'HEAD', base]).trim();
+  const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+  const stackParent = resolveStackParent(branch);
+  ensureStackIsHealthy({ branch, stackParent, baseArg });
+
+  const base = baseArg || stackParent || resolveBase(null);
+  const mergeBase = git(["merge-base", "HEAD", base]).trim();
   const candidateShas = getCandidateCommits(mergeBase);
   const target = resolveTarget(targetArg, candidateShas);
 
-  const diffText = git(['diff', '--no-color', '-U3']);
+  const diffText = git(["diff", "--no-color", "-U3"]);
   if (!diffText.trim()) {
-    console.log('No unstaged changes.');
+    console.log("No unstaged changes.");
     return;
   }
 
@@ -637,19 +713,19 @@ const main = () => {
   printPlan({ groups, candidateShas, perFile, queue, mergeBase, base, dryRun });
 
   if (dryRun) {
-    console.log('\nDry run only — no commits were created.');
+    console.log("\nDry run only — no commits were created.");
     return;
   }
 
   if (queue.length === 0) {
-    console.log('\nNothing to fix up.');
+    console.log("\nNothing to fix up.");
     return;
   }
 
   executeQueue(queue);
   console.log(`\nCreated ${queue.length} fixup commit(s).`);
 
-  rebaseAndPush(mergeBase);
+  rebase(mergeBase);
 };
 
 main();

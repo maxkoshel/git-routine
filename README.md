@@ -23,7 +23,7 @@ left unstaged and reported instead.
 ```bash
 node scripts/fixup-changes.cjs --dry-run [--base=<ref>]   # show the plan, change nothing
 node scripts/fixup-changes.cjs [--base=<ref>]              # create the fixup commits,
-                                                             # then autosquash-rebase and push
+                                                             # then autosquash-rebase (push yourself)
 ```
 
 Refuses to run on the repo's default branch.
